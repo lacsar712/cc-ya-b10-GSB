@@ -9,6 +9,8 @@ from psycopg.rows import dict_row
 
 from db import SCHEMA, connect
 from rules import judge
+import night_service
+import nightwatch
 
 POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "0.5"))
 IDLE_SEC = float(os.environ.get("WORKER_IDLE_SEC", "1.0"))
@@ -42,11 +44,33 @@ def claim_and_process(conn) -> bool:
     return True
 
 
+def maybe_eval_night(last_eval_ts: float) -> float:
+    """周期跑夜间稀采样判定；任何异常都不得影响认领主循环。"""
+    if time.time() - last_eval_ts < nightwatch.EVAL_INTERVAL_SEC:
+        return last_eval_ts
+    try:
+        status = night_service.run_evaluation_once()
+        if status.get("alert"):
+            print(
+                "night sparse-sampling alert: "
+                f"recent_done={status.get('recent_done_count')} "
+                f"threshold={status.get('threshold')}",
+                flush=True,
+            )
+    except psycopg.Error as exc:
+        print(f"night eval db error: {exc}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 提醒链路不能拖垮 worker
+        print(f"night eval error: {exc}", flush=True)
+    return time.time()
+
+
 def main():
     print("yaw-align worker started", flush=True)
     with connect() as conn:
         ensure_schema(conn)
+    last_eval_ts = 0.0
     while True:
+        last_eval_ts = maybe_eval_night(last_eval_ts)
         try:
             with connect() as conn:
                 if claim_and_process(conn):

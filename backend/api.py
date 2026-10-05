@@ -9,6 +9,8 @@ from quart import Quart, jsonify, request
 
 from db import SCHEMA, connect
 from rules import judge
+import night_service
+import nightwatch
 
 SECRET = os.environ.get("JWT_SECRET", "yaw-align-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -185,3 +187,74 @@ async def create_log(user):
 
     row = await run_db(insert)
     return jsonify(row), 201
+
+
+# ---------------------------------------------------------------------------
+# 夜间稀采样提醒：只亮灯 + 记流水，与上面的写口完全解耦——
+# 无论提醒判定结果如何，POST /api/logs 都不会因此被拒收。
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/night/status")
+@require_login
+async def night_status(user):
+    def query():
+        with connect() as conn:
+            status = night_service.evaluate_status(conn, persist=True)
+            conn.commit()
+            return status
+
+    status = await run_db(query)
+    return jsonify(status)
+
+
+@app.get("/api/night/history")
+@require_login
+async def night_history(user):
+    def query():
+        with connect() as conn:
+            return night_service.list_alerts(conn)
+
+    rows = await run_db(query)
+    return jsonify(rows)
+
+
+@app.put("/api/night/settings")
+@require_writer
+async def put_night_settings(user):
+    body = await request.get_json(force=True, silent=True) or {}
+
+    try:
+        threshold = int(body.get("low_sample_threshold"))
+    except (TypeError, ValueError):
+        return jsonify({"detail": "低样本阈值必须是非负整数"}), 400
+    if threshold < 0:
+        return jsonify({"detail": "低样本阈值不能为负数"}), 400
+
+    try:
+        start_t = nightwatch.parse_hhmm(body.get("window_start"))
+        end_t = nightwatch.parse_hhmm(body.get("window_end"))
+    except (TypeError, ValueError):
+        return jsonify({"detail": "夜间时段格式应为 HH:MM"}), 400
+
+    timezone_name = (body.get("timezone") or "Asia/Shanghai").strip()
+    try:
+        nightwatch.validate_timezone(timezone_name)
+    except Exception:
+        return jsonify({"detail": f"不支持的时区：{timezone_name}"}), 400
+
+    def save():
+        with connect() as conn:
+            row = night_service.update_settings(
+                conn,
+                timezone_name=timezone_name,
+                window_start=start_t,
+                window_end=end_t,
+                threshold=threshold,
+                username=user["username"],
+            )
+            conn.commit()
+            return row
+
+    row = await run_db(save)
+    return jsonify(row)
