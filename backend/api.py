@@ -9,6 +9,8 @@ from quart import Quart, jsonify, request
 
 from db import SCHEMA, connect
 from rules import judge
+import night_alerts
+from night_alerts import NightWindowError, NotInNightWindow
 
 SECRET = os.environ.get("JWT_SECRET", "yaw-align-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -37,6 +39,7 @@ async def run_db(fn, *args, **kwargs):
 
 def seed_if_empty(conn):
     conn.execute(SCHEMA)
+    night_alerts.ensure_seed(conn)
     count = conn.execute("SELECT COUNT(*) AS n FROM yaw_logs").fetchone()["n"]
     if count > 0:
         return
@@ -185,3 +188,85 @@ async def create_log(user):
 
     row = await run_db(insert)
     return jsonify(row), 201
+
+
+# ---------------------------------------------------------------------------
+# 夜间稀采样提醒
+#
+# 提醒链路（夜间窗判定 -> 提醒灯 -> 写口）与报送写口 POST /api/logs 完全解耦：
+# 本区块任何逻辑都不会被 create_log 调用，亮灯或判定异常均不得拒收报送。
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/night-alert/status")
+@require_login
+async def night_alert_status(user):
+    """顶栏提醒灯数据源：按服务器时钟实时判定，边沿翻转时写流水。"""
+
+    def query():
+        with connect() as conn:
+            return night_alerts.evaluate(conn)
+
+    status = await run_db(query)
+    return jsonify(status)
+
+
+@app.get("/api/night-alert/config")
+@require_login
+async def get_night_alert_config(user):
+    def query():
+        with connect() as conn:
+            return night_alerts.serialize_config(night_alerts.get_config(conn))
+
+    return jsonify(await run_db(query))
+
+
+@app.put("/api/night-alert/config")
+@require_writer
+async def put_night_alert_config(user):
+    body = await request.get_json(force=True, silent=True) or {}
+
+    def update():
+        with connect() as conn:
+            return night_alerts.update_config(
+                conn,
+                body.get("night_start"),
+                body.get("night_end"),
+                body.get("low_sample_threshold"),
+                user["username"],
+            )
+
+    try:
+        status = await run_db(update)
+    except NightWindowError as exc:
+        return jsonify({"detail": str(exc)}), 400
+    return jsonify(status)
+
+
+@app.get("/api/night-alert/events")
+@require_login
+async def night_alert_events(user):
+    def query():
+        with connect() as conn:
+            return night_alerts.list_events(conn)
+
+    rows = await run_db(query)
+    return jsonify(rows)
+
+
+@app.post("/api/night-alert/clear-recent-done")
+@require_writer
+async def clear_recent_done(user):
+    """清空当前夜间窗内办结记录（验收操作，仅 writer）。"""
+    try:
+        cleared, status = await run_db(
+            lambda: _clear_recent_done(user["username"])
+        )
+    except NotInNightWindow:
+        return jsonify({"detail": "当前不在夜间窗内，无需清空近窗办结"}), 409
+    return jsonify({"cleared": cleared, "status": status})
+
+
+def _clear_recent_done(username):
+    with connect() as conn:
+        return night_alerts.clear_recent_done(conn, username)
